@@ -3,6 +3,7 @@
 import random
 import threading
 import time
+import json
 
 from mininet.net import Mininet
 from mininet.node import RemoteController
@@ -11,9 +12,9 @@ from mininet.link import TCLink
 from mininet.log import setLogLevel
 
 
-def scalable_topology(K=3, T=20, auto_recover=True):
+def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
     """
-    Topologia spine–leaf con ridondanza:
+    Topologia spine–leaf con ridondanza e creazione dinamica delle slice:
     - K spine
     - 2*K leaf
     - K host per leaf
@@ -47,7 +48,26 @@ def scalable_topology(K=3, T=20, auto_recover=True):
 
     net.start()
 
-    # Funzione interna per eventi ambientali (down/up link casuali)
+    # ----- CREAZIONE DINAMICA DELLE SLICE -----
+    def create_slices(hosts, num_slices):
+        slices = {i: [] for i in range(num_slices)}
+        host_list = hosts[:]
+        random.shuffle(host_list)
+
+        for idx, host in enumerate(host_list):
+            slice_id = idx % num_slices
+            slices[slice_id].append(host.name)
+
+        return slices
+
+    slices = create_slices(net.hosts, num_slices)
+    print("\nSlice create dinamicamente:", slices)
+
+    # Salvataggio su file JSON per il controller
+    with open("slices.json", "w") as f:
+        json.dump(slices, f)
+
+    # ----- EVENTI AMBIENTALI -----
     def environmental_events():
         while True:
             time.sleep(T)
@@ -57,7 +77,6 @@ def scalable_topology(K=3, T=20, auto_recover=True):
             print(f"\n*** EVENTO: disabilito link {spine.name} <-> {leaf.name}\n")
             net.configLinkStatus(spine.name, leaf.name, "down")
 
-            # verifica stato link dopo down
             link = net.linksBetween(spine, leaf)[0]
             print(f"Stato link dopo down: {link.intf1.status()} - {link.intf2.status()}")
 
@@ -65,11 +84,8 @@ def scalable_topology(K=3, T=20, auto_recover=True):
                 time.sleep(T)
                 print(f"\n*** RECOVERY: riattivo link {spine.name} <-> {leaf.name}\n")
                 net.configLinkStatus(spine.name, leaf.name, "up")
-
-                # verifica stato link dopo up
                 print(f"Stato link dopo up: {link.intf1.status()} - {link.intf2.status()}")
 
-    # Avvia thread per eventi ambientali
     event_thread = threading.Thread(target=environmental_events, daemon=True)
     event_thread.start()
 
@@ -79,4 +95,4 @@ def scalable_topology(K=3, T=20, auto_recover=True):
 
 if __name__ == "__main__":
     setLogLevel("info")
-    scalable_topology(K=3, T=15, auto_recover=True)
+    scalable_topology(K=3, T=15, auto_recover=True, num_slices=3)
