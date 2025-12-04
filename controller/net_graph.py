@@ -180,7 +180,22 @@ class NetGraph:
     
     def add_link(self, link: NetLink):
         if type(link.node0) == NetHost and type(link.node1) == NetHost:
-            return
+            raise Exception("Cannot connect two hosts directly")
+        links_with_node0 = list(filter(lambda curr_link: curr_link.contains_node(link.node0), self.links))
+        links_with_node1 = list(filter(lambda curr_link: curr_link.contains_node(link.node1), self.links))
+
+        for curr_link in links_with_node0:
+            if curr_link.node0 == link.node0 and curr_link.port1 == link.port1:
+                raise Exception(f'Port {link.port1} already used for {link.node0}')
+            elif curr_link.node1 == link.node0 and curr_link.port2 == link.port1:
+                raise Exception(f'Port {link.port1} already used for {link.node0}')
+
+        for curr_link in links_with_node1:
+            if curr_link.node0 == link.node1 and curr_link.port1 == link.port2:
+                raise Exception(f'Port {link.port2} already used for {link.node1}')
+            elif curr_link.node1 == link.node1 and curr_link.port2 == link.port2:
+                raise Exception(f'Port {link.port2} already used for {link.node1}')
+        
         if link in self.links:
             return
         self.links.append(copy.deepcopy(link))
@@ -332,7 +347,7 @@ class NetGraphTests(unittest.TestCase):
         host2 = NetHost('192.168.1.2')
         sw1 = NetSwitch('0')
         link1 = NetLink(1, 1, NetHost('192.168.1.1'), NetSwitch('0'), 0, 0)
-        link2 = NetLink(1, 1, NetSwitch('0'), NetHost('192.168.1.2'), 0, 0)
+        link2 = NetLink(1, 1, NetSwitch('0'), NetHost('192.168.1.2'), 1, 0)
         graph = NetGraph()
         graph.add_node(host1)
         graph.add_node(host2)
@@ -356,13 +371,13 @@ class NetGraphTests(unittest.TestCase):
         for curr_switch in range(num_switches):
             new_switch = NetSwitch(str(curr_switch + 2))
             graph.add_node(new_switch)
-            graph.add_link(NetLink(1, 1, new_switch, central_switches[0], 0, 0))
-            graph.add_link(NetLink(1, 1, new_switch, central_switches[1], 0, 0))
+            graph.add_link(NetLink(1, 1, new_switch, central_switches[0], 0, curr_switch))
+            graph.add_link(NetLink(1, 1, new_switch, central_switches[1], 1, curr_switch))
             for curr_host in range(hosts_per_switch):
                 curr_ip = f'192.168.{curr_switch+1}.{curr_host+1}'
                 new_host = NetHost(curr_ip)
                 graph.add_node(new_host)
-                graph.add_link(NetLink(1, 1, new_host, new_switch, 0, 1))
+                graph.add_link(NetLink(1, 1, new_host, new_switch, 0, 2+curr_host))
         total_nodes = 2 + num_switches + num_switches * hosts_per_switch
         self.assertEqual(len(graph.nodes), total_nodes)
         path_bw    = graph.find_path(NetHost('192.168.1.1'), NetHost('192.168.6.1'), opt="bw")
@@ -382,8 +397,8 @@ class NetGraphTests(unittest.TestCase):
         host3 = NetHost('192.168.1.3')
         sw1 = NetSwitch('0')
         link1 = NetLink(1, 1, NetHost('192.168.1.1'), NetSwitch('0'), 0, 0)
-        link2 = NetLink(1, 1, NetSwitch('0'), NetHost('192.168.1.2'), 0, 0)
-        link3 = NetLink(1, 1, sw1, host3, 0, 0)
+        link2 = NetLink(1, 1, NetSwitch('0'), NetHost('192.168.1.2'), 1, 0)
+        link3 = NetLink(1, 1, sw1, host3, 2, 0)
         graph = NetGraph()
         graph.add_node(host1)
         graph.add_node(host2)
@@ -414,8 +429,8 @@ class NetGraphTests(unittest.TestCase):
         host3 = NetHost('192.168.1.3')
         sw1 = NetSwitch('0')
         link1 = NetLink(1, 1, NetHost('192.168.1.1'), NetSwitch('0'), 0, 0)
-        link2 = NetLink(1, 1, NetSwitch('0'), NetHost('192.168.1.2'), 0, 0)
-        link3 = NetLink(1, 1, sw1, host3, 0, 0)
+        link2 = NetLink(1, 1, NetSwitch('0'), NetHost('192.168.1.2'), 1, 0)
+        link3 = NetLink(1, 1, sw1, host3, 2, 0)
         graph = NetGraph()
         graph.add_node(host1)
         graph.add_node(host2)
