@@ -127,6 +127,28 @@ class RestServer(wsgi.ControllerBase):
                     logger.error(f'[REST] Node 1 of link at index {index} is malformed: {node1}')
                     return {'status': 'E_INV_NODE'}, 400
                 
+                if not isinstance(link['port0'], str):
+                    link['port0'] = str(link['port0'])
+
+                if not isinstance(link['port1'], str):
+                    link['port1'] = str(link['port1'])
+
+                if isinstance(link['delay'], str):
+                    try:
+                        if 'ms' in link['delay']:
+                            link['delay'] = link['delay'].replace('ms', '')
+                        link['delay'] = float(link['delay'])
+                    except:
+                        logger.error('[REST] Invalid delay')
+                        return {'status': 'E_INV_DELAY'}, 400
+                    
+                if isinstance(link['bw'], str):
+                    try:
+                        link['bw'] = float(link['bw'])
+                    except:
+                        logger.error('[REST] Invalid bw')
+                        return {'status': 'E_INV_BW'}, 400
+                
                 net_link = net_graph.NetLink(link['bw'], link['delay'], net_node0, net_node1, link['port0'], link['port1'])
                 if graph.contains_link(net_link):
                     logger.error(f'[REST] Link at index {index} is repeated')
