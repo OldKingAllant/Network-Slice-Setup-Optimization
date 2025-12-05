@@ -80,8 +80,6 @@ class RestServer(wsgi.ControllerBase):
         link = {"node0": node, "node1": node, "port0": str, "port1": str, "bw": float, "delay": float}
         {"nodes": [node...], "links": [{"node0": }]}
         """
-        node_type = typing.Dict[str, str]
-        link_type = typing.Dict[str, typing.Any]
         body: typing.Dict[str, typing.List] = json.loads(req.body.decode())
         if type(body) != type({}):
             logger.error(f'[REST] Invalid body received: {body}')
@@ -141,6 +139,28 @@ class RestServer(wsgi.ControllerBase):
         print(list(map(lambda link: str(link), graph.links)))
         self.data['graph'] = graph
         return {'status': 'E_OK'}, 200
+    
+    @route_handler(http_method="POST")
+    def handle_qos(self, req: Request, **_kwargs):
+        body: typing.List[typing.Dict[str, float]] = json.loads(req.body.decode())
+        if not isinstance(body, type([])):
+            logger.error(f'[REST] Invalid body received: {body}')
+            return {'status': 'E_INV_BODY'}, 400
+        required_fields = ["min_bw", "max_bw", "min_delay", "max_delay"]
+        required_types = {"min_bw": float, "max_bw": float, "min_delay": float, "max_delay": float}
+        for index, qos in enumerate(body):
+            has_fields = all(field in required_fields for field in qos)
+            if not has_fields:
+                missing = [field for field in required_fields if field not in qos]
+                logger.error(f'[REST] QoS {index} is missing some fields: {missing}')
+                return {'status': 'E_MISSING_FIELDS', 'qos': index, 'list': missing}, 400
+            respects_types = all(isinstance(value, required_types[field]) for field, value in qos.items())
+            if not respects_types:
+                logger.error(f'[REST] QoS {index} is missing has some invalid fields')
+                return {'status': 'E_INV_TYPES', 'qos': index}
+        self.data['qos'] = body
+        logger.info(f'[REST] Received queues: {body}')
+        return {'status': 'E_OK'}, 200
 
 class SliceController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -158,6 +178,7 @@ class SliceController(app_manager.RyuApp):
         self.mapper = self.wsgi.mapper
         self.mapper.connect('/api/v0/slices', controller=RestServer, action='handle_slices', conditions=dict(method=['POST']))
         self.mapper.connect('/api/v0/graph', controller=RestServer, action='handle_net', conditions=dict(method=['POST']))
+        self.mapper.connect('/api/v0/qos', controller=RestServer, action='handle_qos', conditions=dict(method=['POST']))
         self.wsgi.registory['RestServer'] = self.data
         self.data['graph'] = None
 

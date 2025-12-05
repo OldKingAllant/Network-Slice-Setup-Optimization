@@ -1,0 +1,6 @@
+[
+    {"min_bw": "40", "max_bw": "50", "min_delay": "5ms", "max_delay": "5ms"},
+    {"min_bw": "40", "max_bw": "50", "min_delay": "5ms", "max_delay": "5ms"},
+    {"min_bw": "40", "max_bw": "50", "min_delay": "5ms", "max_delay": "5ms"},
+    {"min_bw": "40", "max_bw": "50", "min_delay": "5ms", "max_delay": "5ms"}
+]
