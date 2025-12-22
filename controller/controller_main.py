@@ -7,8 +7,8 @@ from ryu.ofproto import ofproto_v1_3
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
 from ryu.lib.packet import ether_types
-from ryu.lib.packet import ipv4
-from ryu.lib.packet import arp
+from ryu.lib.packet import lldp
+from ryu.lib import hub
 
 from ryu.app import wsgi
 from ryu.app.wsgi import Request, Response
@@ -20,15 +20,22 @@ import copy
 
 import net_graph
 
+from stats_monitor import StatsMonitor
+
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 def route_handler(http_method: str):
+    """
+    Return an handler for the specified HTTP method, which will
+    perform some pre and post processing around the
+    true handler. 
+    """
     def route_handler_wrap(method):
         def wrapper(self, req: Request, *args, **kwargs):
             if req.method != http_method:
                 return Response(content_type='application/json', body=json.dumps({'status': 'E_INV_METHOD'}), status=400)
-            if req.method == 'POST':
+            if req.method == 'POST' or req.method == 'PUT':
                 if req.headers.get('ContentType') != 'application/json' or not req.body:
                     message = {'status': 'E_INV_CONTENT'}
                     return Response(content_type='application/json', body=json.dumps(message), status=400)
@@ -60,7 +67,14 @@ class ShutdownEvent(ofp_event.event.EventBase):
     def __init__(self):
         super().__init__()
 
+class RouteReevaluateEvent(ofp_event.event.EventBase):
+    def __init__(self):
+        super().__init__()
+
 class RestServer(wsgi.ControllerBase):
+    """
+    HTTP Server associated to the controller
+    """
     def __init__(self, req, link, data: typing.Dict, **config):
         super(RestServer, self).__init__(req, link, data, **config)
 
@@ -195,6 +209,11 @@ class RestServer(wsgi.ControllerBase):
     
     @route_handler(http_method="POST")
     def handle_init_end(self, req: Request, **_kwargs):
+        """
+        Should be called after the previous three API endpoints. 
+        Will kickstart the creation of flows between hosts
+        in the same slice
+        """
         body: typing.Dict[str, typing.Any] = json.loads(req.body.decode())
         if not isinstance(body, type({})):
             logger.error(f'[REST] Invalid body received: {body}')
@@ -216,8 +235,19 @@ class RestServer(wsgi.ControllerBase):
         app.send_event('SliceController', ShutdownEvent())
         return {'status': 'E_OK'}, 200
     
+    #----------------------------------------------------------------------------------
+    
     @route_handler(http_method="POST")
     def handle_service_create(self, req: Request, **_kwargs):
+        """
+        Creates a new service and returns the associated ID
+
+        Body format:
+        
+        \{
+        "name": name of the service
+        \}
+        """
         #put service in list, attempt routing
         return {'status': 'E_OK'}, 200
     
@@ -229,7 +259,24 @@ class RestServer(wsgi.ControllerBase):
     @route_handler(http_method="DELETE")
     def handle_service_remove(self, req: Request, **_kwargs):
         #remove a service
+        if not "id" in _kwargs:
+            return {'status': 'E_MISSING_ID'}, 400
         return {'status': 'E_OK'}, 200
+    
+    @route_handler(http_method="POST")
+    def handle_service_add_client(self, req: Request, **_kwargs):
+        return {'status': 'E_OK'}, 200
+    
+    @route_handler(http_method="DELETE")
+    def handle_service_remove_client(self, req: Request, **_kwargs):
+        return {'status': 'E_OK'}, 200
+
+# Attempt to reoptimize routes every interval seconds
+ROUTE_OPT_INTERVAL = 10
+# 
+BW_UPDATE_THRESHOLD_RATIO = 0.1
+
+COMMON_CONFIG_FILE = "./config/common.json"
 
 class SliceController(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -241,17 +288,28 @@ class SliceController(app_manager.RyuApp):
 
     def __init__(self, *_args, **_kwargs):
         super(SliceController, self).__init__(*_args, **_kwargs)
-        #All datapaths, needed to contact switches
+        # Data that needs to be shared with the REST server
         self.data: typing.Dict[str, typing.Any] = {}
+        # All datapaths
         self.dpaths: dpset.DPSet = _kwargs['dpset']
         self.wsgi: wsgi.WSGIApplication = _kwargs['wsgi']
+        # All currently established paths between endpoints
         self.created_paths: typing.Dict[typing.Tuple[str, str], typing.List] = {}
+        # All cookies associated to each path (useful for modifying/deleting flows)
         self.path_cookies: typing.Dict[typing.Tuple[str, str], typing.List[typing.Tuple[net_graph.NetSwitch, typing.List[int]]]] = {}
+        # QoS associated to each path
         self.path_qos: typing.Dict[typing.Tuple[str, str], int] = {}
+        # All paths that could not be routed, with their QoS
         self.unrouted_paths: typing.Dict[typing.Tuple[str, str], int] = {}
+        # All routed paths not respecting QoS
         self.paths_without_qos: typing.Dict[typing.Tuple[str, str], int] = {}
-        self.curr_cookie: int = 0
-        self.mapper = self.wsgi.mapper
+        # All port stats changes not already applied to th graph
+        self.port_stat_changes: typing.Dict[str, typing.List[int]] = {}
+        # Incrementing value used to set cookies for flows
+        # Start from one since cookies with value zero
+        # are used for default flows
+        self.curr_cookie: int = 1
+        self.mapper: wsgi.Mapper = self.wsgi.mapper
         self.mapper.connect('/api/v0/slices', controller=RestServer, action='handle_slices', conditions=dict(method=['POST']))
         self.mapper.connect('/api/v0/graph', controller=RestServer, action='handle_net', conditions=dict(method=['POST']))
         self.mapper.connect('/api/v0/qos', controller=RestServer, action='handle_qos', conditions=dict(method=['POST']))
@@ -259,12 +317,23 @@ class SliceController(app_manager.RyuApp):
         self.mapper.connect('/api/v0/shutdown', controller=RestServer, action='handle_shutdown', conditions=dict(method=['POST']))
         self.mapper.connect('/api/v0/service/create', controller=RestServer, action='handle_service_create', conditions=dict(method=['POST']))
         self.mapper.connect('/api/v0/service/list', controller=RestServer, action='handle_service_get', conditions=dict(method=['GET']))
-        self.mapper.connect('/api/v0/service/remove', controller=RestServer, action='handle_service_remove', conditions=dict(method=['DELETE']))
+        self.mapper.connect('/api/v0/service/:id/remove', controller=RestServer, action='handle_service_remove', conditions=dict(method=['DELETE']))
+        self.mapper.connect('/api/v0/service/:id/clientadd/:clientip', controller=RestServer, action='handle_service_add_client', conditions=dict(method=['POST']))
+        self.mapper.connect('/api/v0/service/:id/clientremove/:clientip', controller=RestServer, action='handle_service_remove_client', conditions=dict(method=['DELETE']))
         self.wsgi.registory['RestServer'] = self.data
         self.data['graph'] = None
         self.data['app'] = self
+        self.data['stat_monitor'] = StatsMonitor()
+        self.route_opt_thread = hub.spawn(self._route_reevaluate_loop)
+
+        with open(COMMON_CONFIG_FILE) as conf_file:
+            self.data['conf'] = json.load(conf_file)
 
     def add_flow(self, dp: Datapath, match_rule, instructions, prio=0x7FFF, cookie=0):
+        """
+        Add flow to datapath, with given match and instructions, plus priority
+        and cookie
+        """
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
         flow_mod = parser.OFPFlowMod(
@@ -276,6 +345,9 @@ class SliceController(app_manager.RyuApp):
         return
     
     def remove_flow(self, dp: Datapath, match_rule, instructions, prio=0x7FFF, cookie=0, cookie_mask= 0xFFFFFFFFFFFFFFFF, table_id=ofproto_v1_3.OFPTT_ALL, out_port=ofproto_v1_3.OFPP_ANY, out_group=ofproto_v1_3.OFPG_ANY):
+        """
+        Remove flow from datapath, also based on cookie
+        """
         ofproto = dp.ofproto
         parser = dp.ofproto_parser
         flow_mod = parser.OFPFlowMod(
@@ -308,11 +380,32 @@ class SliceController(app_manager.RyuApp):
         instruction = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, \
                                                     action)]
         self.add_flow(dp, match_rule, instruction, 0)
+
+        #Forward to controller with higher priority
+        match_lldp_nearest_bridge = parser.OFPMatch(in_port=ofproto_v1_3.OFPP_ANY, eth_type=ether_types.ETH_TYPE_LLDP, eth_dst=lldp.LLDP_MAC_NEAREST_BRIDGE)
+        action = [parser.OFPActionOutput(ofproto.OFPP_CONTROLLER)]
+        instruction = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, \
+                                                    action)]
+        self.add_flow(dp, match_lldp_nearest_bridge, instruction, 2)
+
+        #still higher priority than base rule, but lower than the last one
+        match_lldp_general = parser.OFPMatch(in_port=ofproto_v1_3.OFPP_ANY, eth_type=ether_types.ETH_TYPE_LLDP)
+        instruction = [parser.OFPInstructionActions(ofproto.OFPIT_CLEAR_ACTIONS, [])]
+        self.add_flow(dp, match_lldp_general, instruction, 1)
+
         self.data['dpaths'] = self.dpaths
+        stat_monitor: StatsMonitor = self.data['stat_monitor']
+        stat_monitor.register_datapath(dp)
         return
     
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def packet_in_handler(self, ev: ofp_event.EventOFPMsgBase):
+        """
+        Handler for switch-forwarded packets. Ideally it should use LLDP
+        packets to learn the layout of the  network, but for now
+        we will use a static graph (e.g. static from the point
+        of view of the nodes and the connections between them)
+        """
         msg = ev.msg
         dp: Datapath = msg.datapath
         ofp = dp.ofproto
@@ -328,12 +421,21 @@ class SliceController(app_manager.RyuApp):
         _eth: ethernet.ethernet = _eth_protocols[0] 
 
         if _eth.ethertype == ether_types.ETH_TYPE_LLDP:
+            _lldp_protocol: lldp.lldp = _packet.get_protocols(lldp.lldp)[0]
+            logger.info(f"[CONTROLLER] Received LLDP packet from switch {dp.id:016x}, dst MAC: {_eth.dst}")
+            logger.info(f"[CONTROLLER] LLDP packet with {len(_lldp_protocol.tlvs)} TLVs")
+            #for tlv in _lldp_protocol.tlvs:
+            #    print(tlv.tlv_type)
             return
         return
     
     def create_route_flows(self, links: typing.List[net_graph.NetLink], begin: net_graph.NetHost, end: net_graph.NetHost, qos: int, cookies: typing.List[typing.Tuple[net_graph.NetSwitch, typing.List[int]]]):
+        """
+        Create all flows to make communication work between two endpoints while respecting QoS, will put all
+        used cookies inside the provided list
+        """
         for link, next_link in zip(links, links[1:]):
-            if isinstance(next_link.node0, net_graph.NetHost):
+            if isinstance(next_link.node0, net_graph.NetHost): #Expect that the two endpoints are the hosts
                 logger.error('[CONTROLLER] Unexpected sequence in path')
                 raise Exception("Invalid path")
             logger.info(f'[CONTROLLER] Add {begin} -> {end} to {link.node1.dpid}, in port: {link.port2}, out port: {next_link.port1}, first delay: {link.delay}, second delay: {next_link.delay}')
@@ -376,6 +478,9 @@ class SliceController(app_manager.RyuApp):
         return
     
     def remove_route_flows(self, begin: net_graph.NetHost, end: net_graph.NetHost, cookies: typing.List[typing.Tuple[net_graph.NetSwitch, typing.List[int]]]):
+        """
+        Remove all flows associated to a path, using the provided cookie list
+        """
         for switch, cookie_list in cookies:
             dpid = int(switch.dpid, 16)
             dp: Datapath = self.dpaths.get(dpid)
@@ -432,12 +537,16 @@ class SliceController(app_manager.RyuApp):
         if (begin.ip, end.ip) not in self.path_cookies:
             raise Exception(f"path_cookies does not contain {begin} -> {end}")
         logger.info(f"[CONTROLLER] Delete path {begin} -> {end}")
+
+        graph: net_graph.NetGraph = self.data['graph']
+        if not graph.free_path_used_bw(self.created_paths[(begin.ip, end.ip)]):
+            logger.error(f"[CONTROLLER] Could not free bandwidth")
         self.remove_route_flows(begin, end, self.path_cookies[(begin.ip, end.ip)])
         del self.path_cookies[(begin.ip, end.ip)]
         del self.created_paths[(begin.ip, end.ip)]
         prev_qos = self.path_qos[(begin.ip, end.ip)]
         del self.path_qos[(begin.ip, end.ip)]
-        graph: net_graph.NetGraph = self.data['graph']
+        
         if not graph.cache_invalidate_path(begin, end):
             logger.info("[CONTROLLER] Path already invalidated in cache")
         if (begin.ip, end.ip) in self.paths_without_qos:
@@ -450,6 +559,8 @@ class SliceController(app_manager.RyuApp):
     def init_handler(self, ev: ofp_event.EventOFPMsgBase):
         logger.info('[CONTROLLER] Init event')
         slices: typing.Dict[str, typing.List[str]] = self.data['slices']
+        dns_ip: str = self.data['conf']['dns_ip']
+        logger.info(f'[CONTROLLER] DNS IP: {dns_ip}')
         for slice_name, hosts in slices.items():
             for host in hosts:
                 for other_host in hosts:
@@ -458,6 +569,8 @@ class SliceController(app_manager.RyuApp):
                         success = self.create_route(net_graph.NetHost(host), net_graph.NetHost(other_host), self.data['default_qos'], True)
                     if not success:
                         logger.info(f'{host} -> {other_host} not possible')
+                self.create_route(net_graph.NetHost(host), net_graph.NetHost(dns_ip), self.data['default_qos'], True)
+
         return
     
     @set_ev_cls(ShutdownEvent, MAIN_DISPATCHER)
@@ -475,37 +588,90 @@ class SliceController(app_manager.RyuApp):
         self.created_paths.clear()
         self.path_cookies.clear()
         self.path_qos.clear()
+        stat_monitor: StatsMonitor = self.data['stat_monitor']
+        stat_monitor.stop_monitor()
 
 
     def attempt_rerouting(self):
-        unrouted_paths_temp = copy.deepcopy(self.unrouted_paths)
-        logger.info(f"[CONTROLLER] Found {len(unrouted_paths_temp)} unrouted paths")
-        for (begin, end), qos in unrouted_paths_temp.items():
-            logger.info(f"[CONTROLLER] Attempting to route {begin} -> {end}")
-            success = self.create_route(net_graph.NetHost(begin), net_graph.NetHost(end), qos, False)
-            if not success:
-                success = self.create_route(net_graph.NetHost(begin), net_graph.NetHost(end), qos, True)
-            if not success:
-                logger.info(f'[CONTROLLER] {begin} -> {end} not possible, maybe one end-point is isolated?')
+        if not 'graph' in self.data or 'qos' not in self.data:
+            return
+        
+        # Apply changes to stats received from StatsMonitor,
+        # we get a list of paths that we may need to change
+        old_paths = self.apply_port_changes()
 
         qos_config: list[typing.Dict[str, typing.Any]] = self.data['qos']
         graph: net_graph.NetGraph = self.data['graph']
         paths_without_qos_temp = copy.deepcopy(self.paths_without_qos)
         logger.info(f"[CONTROLLER] Found {len(paths_without_qos_temp)} routed paths not respecting QoS")
-        for (begin, end), qos in paths_without_qos_temp.items():
-            #curr_path = copy.deepcopy(self.created_paths[(begin, end)])
-            logger.info(f"[CONTROLLER] Attempting to reroute {begin} -> {end}")
-            alternative_path = graph.find_path(net_graph.NetHost(begin), net_graph.NetHost(end), opt="hops", max_delay=qos_config[qos]["max_delay"], 
-                                               min_bw=qos_config[qos]['min_bw'], ignore_cache=True, keep_cache=True)
-            if alternative_path == None:
-                logger.info(f"[CONTROLLER] Reroute failed, continue")
-                continue
-            logger.info(f"[CONTROLLER] Reroute success, removing previous path")
-            self.remove_route(net_graph.NetHost(begin), net_graph.NetHost(end), True)
-            if not self.create_route(net_graph.NetHost(begin), net_graph.NetHost(end), qos, False):
-                logger.info(f"[CONTROLLER] But it failed? Fallback to best effort")
-                if not self.create_route(net_graph.NetHost(begin), net_graph.NetHost(end), qos, True):
-                    logger.info(f'[CONTROLLER] {begin} -> {end} not possible, maybe one end-point is isolated?')
+
+        def reroute_paths(self: SliceController, paths: typing.Dict[typing.Tuple[str, str], int]):
+            for (begin, end), qos in paths.items():
+                begin_host = net_graph.NetHost(begin)
+                end_host = net_graph.NetHost(end)
+
+                logger.info(f"[CONTROLLER] Attempting to reroute {begin} -> {end}")
+                alternative_path = graph.find_path(begin_host, end_host, opt="hops", max_delay=qos_config[qos]["max_delay"], 
+                                                   min_bw=qos_config[qos]['min_bw'], ignore_cache=True, keep_cache=True,
+                                                   old_path=self.created_paths[(begin, end)])
+
+
+                begin_end_in_old_paths = (begin_host, end_host) in old_paths
+                end_begin_in_old_paths = (end_host, begin_host) in old_paths
+
+                if alternative_path == None:
+                    logger.info(f"[CONTROLLER] Reroute failed, continue")
+                    #if begin_end_in_old_paths or end_begin_in_old_paths:
+                    #    if (end, begin) in self.created_paths:
+                    #        begin, end = end, begin
+                    graph._cache_add(begin_host, end_host, self.created_paths[(begin, end)], "hops") # Yes, we should still try rerouting
+                                                                                                     # for "best effort", but for now we will do this
+                else:
+                    if alternative_path == self.created_paths[(begin, end)]:
+                        logger.info(f"[CONTROLLER] Graph computed same path, reinsert in cache")
+                        graph._cache_add(begin_host, end_host, self.created_paths[(begin, end)], "hops") # Well this can happen
+                                                                                                         # especially if the path was invalidated by a stat update
+                    else:
+                        logger.info(f"[CONTROLLER] Reroute success, removing previous path")
+                        self.remove_route(net_graph.NetHost(begin), net_graph.NetHost(end), True)
+                        if not self.create_route(net_graph.NetHost(begin), net_graph.NetHost(end), qos, False):
+                            logger.error(f"[CONTROLLER] But it failed? Fallback to best effort")
+                            if not self.create_route(net_graph.NetHost(begin), net_graph.NetHost(end), qos, True):
+                                logger.info(f'[CONTROLLER] {begin} -> {end} not possible, maybe one end-point is isolated?')
+
+                if begin_end_in_old_paths:
+                    del old_paths[(begin_host, end_host)]
+                if end_begin_in_old_paths:
+                    del old_paths[(begin_host, end_host)]
+
+        #typing.Dict[typing.Tuple[str, str], int]
+        reroute_paths(self, paths_without_qos_temp)
+        old_paths_endpoints = [(begin.ip, end.ip) for begin, end in old_paths.keys()]
+        old_paths_endpoints = list(map(lambda path: (path[1], path[0]) if (path[1], path[0]) in self.path_qos else path, old_paths_endpoints))
+        old_paths_with_qos = {path: self.path_qos[path] for path in old_paths_endpoints}
+        reroute_paths(self, old_paths_with_qos)
+
+        if len(old_paths) != 0:
+            logger.error(f"[CONTROLLER] Not all modified paths have been re-evaluated")
+
+        # Perform routing of unrouted paths AFTER trying to optimize paths
+        # that do not meet QoS, otherwise we might end up trying
+        # to optimize paths that have been just created and do not
+        # meet QoS, which would end up giving the same result
+        unrouted_paths_temp = copy.deepcopy(self.unrouted_paths)
+        logger.info(f"[CONTROLLER] Found {len(unrouted_paths_temp)} unrouted paths")
+        for (begin, end), qos in unrouted_paths_temp.items():
+            begin_host = net_graph.NetHost(begin)
+            end_host = net_graph.NetHost(end)
+            if (begin_host, end_host) in old_paths or (end_host, begin_host) in old_paths:
+                logger.error(f"[CONTROLLER] Unrouted path marked as invalid")
+            logger.info(f"[CONTROLLER] Attempting to route {begin} -> {end}")
+            success = self.create_route(begin_host, end_host, qos, False)
+            if not success:
+                success = self.create_route(begin_host, end_host, qos, True)
+            if not success:
+                logger.info(f'[CONTROLLER] {begin} -> {end} not possible, maybe one end-point is isolated?')
+        
         return
 
     
@@ -536,7 +702,6 @@ class SliceController(app_manager.RyuApp):
         if len(all_links) == 0:
             return
         
-        #logger.info(list(map(lambda link: link.get_node_port(switch_node)[0], all_links)))
         links_with_port = list(filter(lambda link: link.get_node_port(switch_node)[0] == str(port_no), all_links))
 
         if len(links_with_port) != 1:
@@ -560,6 +725,91 @@ class SliceController(app_manager.RyuApp):
             for begin, end, path in mod_paths:
                 logger.info(f"[CONTROLLER] {begin} -> {end} invalidated")
                 self.remove_route(begin, end, True) 
-
-        self.attempt_rerouting()
+            self.attempt_rerouting()
         return
+    
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def handle_port_stats_reply(self, ev: ofp_event.EventOFPMsgBase):
+        stat_monitor: StatsMonitor = self.data['stat_monitor']
+        changes = stat_monitor.handle_port_stats_reply(ev)
+        self.port_stat_changes[changes[0]] = changes[1]
+
+    def _route_reevaluate_loop(self):
+        while True:
+            hub.sleep(ROUTE_OPT_INTERVAL)
+            self.send_event('SliceController', RouteReevaluateEvent())
+
+    def apply_port_changes(self) -> typing.Dict[typing.Tuple[net_graph.NetHost, net_graph.NetHost], typing.List[net_graph.NetLink]]:
+        if len(self.port_stat_changes) == 0:
+            return {}
+
+        if "graph" not in self.data:
+            self.port_stat_changes.clear()
+            return {}
+
+        graph: net_graph.NetGraph = self.data['graph']
+        stat_monitor: StatsMonitor = self.data['stat_monitor']
+
+        all_modified_links: list[net_graph.NetLink] = []
+
+        inv_paths: typing.Dict[typing.Tuple[net_graph.NetHost, net_graph.NetHost], typing.List[net_graph.NetLink]] = {}
+
+        for dpid, changed_ports in self.port_stat_changes.items():
+            dpid_str = f"{int(dpid):016x}"
+            switch_node = net_graph.NetSwitch(dpid_str)
+            all_links = graph.get_links_with_node(switch_node)
+
+            logger.info(f"[CONTROLLER] Applying changes for switch {dpid_str}, {len(changed_ports)} influenced")
+            if len(all_links) == 0:
+                continue
+
+            for port_no in changed_ports:
+                links_with_port = list(filter(lambda link: link.get_node_port(switch_node)[0] == str(port_no), all_links))
+
+                if len(links_with_port) != 1:
+                    logger.error(f"{list(map(lambda link: str(link), links_with_port))}")
+                    continue
+
+                modified_link = links_with_port[0]
+                port_id = modified_link.get_node_port(switch_node)[1]
+
+                if port_id != 0 and port_id != 1:
+                    logger.error("[CONTROLLER] Nani?")
+                    continue
+
+                curr_bw = stat_monitor.get_bandwidth(dpid, port_no)
+
+                logger.debug(f"[CONTROLLER] Modify port link {modified_link}, used bw: {curr_bw}")
+
+                if modified_link in all_modified_links:
+                    logger.debug(f"[CONTROLLER] Link already modified")
+                    continue
+
+                old_used_bw = float(modified_link.max_bw) - float(modified_link.bw)
+                bw_ratio = (abs(float(curr_bw) - old_used_bw) / float(modified_link.max_bw))
+                if bw_ratio >= BW_UPDATE_THRESHOLD_RATIO:
+                    logger.debug(f"[CONTROLLER] Bandwidth ratio {bw_ratio:.4f} >= {BW_UPDATE_THRESHOLD_RATIO:.4f}")
+                else :
+                    logger.debug(f"[CONTROLLER] Bandwidth ratio not reached, skipping")
+                    continue
+
+                all_modified_links.append(modified_link)
+                for begin, end, path in graph.modify_curr_link_bw(modified_link, curr_bw):
+                    if (begin, end) in inv_paths or (end, begin) in inv_paths:
+                        logger.error(f"[CONTROLLER] Link not considered modified, but path already marked as invalid")
+                    else:
+                        logger.debug(f"[CONTROLLER] Path invalidated")
+                        inv_paths[(begin, end)] = path
+
+        self.port_stat_changes.clear()
+
+        if len(all_modified_links) == 0:
+            return {}
+        
+        logger.info(f"[CONTROLLER] Stat update caused {len(inv_paths)} paths to be invalidated")
+        return inv_paths
+
+    @set_ev_cls(RouteReevaluateEvent, MAIN_DISPATCHER)
+    def handle_route_reevaluate(self, ev: ofp_event.EventOFPMsgBase):
+        logger.info("[CONTROLLER] Route re-evaluation")
+        self.attempt_rerouting()

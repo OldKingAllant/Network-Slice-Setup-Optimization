@@ -148,6 +148,12 @@ class NetLink:
             raise Exception("Occupied bw greater than max bw?")
         self.bw = self.max_bw - used_bw
 
+    def add_to_bw(self, freed_bw: float):
+        """
+        Free some bandwidth
+        """
+        self.bw = min(self.max_bw, self.bw + freed_bw)
+
 class NetGraph:
     def __init__(self):
         self.links: list[NetLink] = []
@@ -375,7 +381,7 @@ class NetGraph:
     def contains_link(self, link: NetLink):
         return link in self.links
 
-    def find_paths(self, host1: NetHost, host2: NetHost, min_bw: float, max_delay: float):
+    def find_paths(self, host1: NetHost, host2: NetHost, min_bw: float, max_delay: float, old_path: List[NetLink]):
         """
         Find all possible paths between two endpoints, filtering by 
         the provided constraints
@@ -389,6 +395,10 @@ class NetGraph:
         # Returns
         List of possible paths
         """
+        used_bw = self.get_path_used_bw(old_path)
+        if used_bw == None:
+            used_bw = 0.0
+
         if host1 == host2: # Do not return None, since a path exists, it just only is of length zero
             return []
         if not host1 in self.nodes or not host2 in self.nodes:
@@ -404,7 +414,12 @@ class NetGraph:
             start = copy.deepcopy(start)
             start.exchange_nodes()
 
-        if start.bw < min_bw or start.delay > max_delay or start.is_down(): # Check if the first link respects constraints
+        possible_free_bw = 0.0
+        if start in old_path: # If a link is on the old path, consider the currently used
+                              # bandwidth as free
+            possible_free_bw = used_bw
+
+        if start.bw + possible_free_bw < min_bw or start.delay > max_delay or start.is_down(): # Check if the first link respects constraints
             return None
 
         init_path = [start]
@@ -434,7 +449,14 @@ class NetGraph:
                 new_path.append(link)
                 next_min_bw = min(curr_min_bw, float(link.bw))
                 next_delay = curr_delay + link.delay
-                if next_min_bw >= min_bw and next_delay <= max_delay and not link.is_down():
+
+                # Do same thing as the first link, consider
+                # bandwidth used by the current path as free
+                possible_free_bw = 0.0
+                if link in old_path:
+                    possible_free_bw = used_bw
+
+                if next_min_bw + possible_free_bw >= min_bw and next_delay <= max_delay and not link.is_down():
                     find_path_sub(self, copy.deepcopy(visited_nodes), new_path, next_min_bw, next_delay)
         find_path_sub(self, [host1], init_path, start.bw, start.delay)
         if len(paths) == 0:
@@ -466,6 +488,7 @@ class NetGraph:
         min_bw = 0 if "min_bw" not in kwargs else kwargs["min_bw"]
         max_delay = float('inf') if "max_delay" not in kwargs else kwargs["max_delay"]
         keep_cache = False if "keep_cache" not in kwargs else kwargs["keep_cache"]
+        old_path: List[NetLink] = [] if "old_path" not in kwargs else kwargs["old_path"]
         if not ignore_cache:
             path: list[NetLink] = self.cache_get(host1, host2, opt)
             if path != None:
@@ -480,7 +503,7 @@ class NetGraph:
         opt_options = ["none", "bw", "delay", "hops"]
         if not opt in opt_options:
             raise Exception("Invalid optimization")
-        paths = self.find_paths(host1, host2, min_bw, max_delay)
+        paths = self.find_paths(host1, host2, min_bw, max_delay, old_path)
         if paths == None:
             return None
         the_path = None
@@ -505,6 +528,43 @@ class NetGraph:
     
     def get_links_with_node(self, node: NetNode):
         return list(filter(lambda link: link.contains_node(node), self.links))
+    
+    def get_path_used_bw(self, path: List[NetLink]):
+        """
+        Returns the estimated bw used by the path
+        """
+        if len(path) == 0:
+            return None
+        if not path[0] in self.links or not path[-1] in self.links:
+            return None
+        
+        first_index = self.links.index(path[0])
+        last_index = self.links.index(path[-1])
+
+        last_links = self.links[first_index], self.links[last_index]
+
+        # Return the minimum value between the two used bandwidths, since
+        # we expect that the remaining traffic comes from another path
+        return min(last_links[0].max_bw - last_links[0].bw, last_links[1].max_bw - last_links[1].bw)
+    
+    def free_path_used_bw(self, path: List[NetLink]):
+        """
+        Compute bw used by the path and free that
+        bandwidth from all links contained
+        """
+        if not all(link in self.links for link in path):
+            return False
+        used_bw = self.get_path_used_bw(path)
+        if used_bw == None:
+            return False 
+        for link in path:
+            link_index = self.links.index(link)
+            real_link = self.links[link_index]
+            real_link.add_to_bw(used_bw)
+        return True
+        
+        
+
     
 def get_path_extremes(path: List[NetLink]):
     if len(path) == 0:

@@ -4,9 +4,11 @@ import random
 import threading
 import time
 import json
+from subprocess import Popen
+import os
 
-from mininet.net import Mininet, Node
-from mininet.node import RemoteController
+from mininet.net import Containernet, Node
+from mininet.node import RemoteController, Docker
 from mininet.cli import CLI
 from mininet.link import TCLink
 from mininet.log import setLogLevel
@@ -17,6 +19,8 @@ import queues
 
 SERVER_IP = '127.0.0.1'
 SERVER_PORT = 8080
+
+COMMON_CONFIG_FILE = "./config/common.json"
 
 
 def get_port_no(intf):
@@ -37,14 +41,29 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
     - every T seconds a random spine–leaf link fails
     """
     cleanup()
-    net = Mininet(controller=RemoteController, link=TCLink)
+    net = Containernet(controller=RemoteController, link=TCLink)
     net.addController("c0")
+
+    with open(COMMON_CONFIG_FILE) as conf:
+        common_config = json.load(conf)
+
+    dns_server: Docker = net.addDocker('dns_server', dimage="dns-server-mn", ip=f"{common_config['dns_ip']}", 
+                  port_bindings={5380:5380, 53:53}, environment={"DNS_SERVER_ADMIN_PASSWORD": "admin"}, 
+                  sysctls={"net.ipv4.ip_local_port_range": "1024 65535"})
+    
+    if not os.path.exists('./logs'):
+        os.mkdir('./logs')
+    
+    redirect_logs = Popen(["docker logs -f mn.dns_server &> ./logs/dns_log.txt"], shell=True)
 
     # ----- SPINE SWITCHES -----
     spine_switches = []
     for i in range(K):
         spine = net.addSwitch(f"s_spine_{i+1}", dpid=f"1{i+1:03d}", datapath='osvk', protocols='OpenFlow13')
         spine_switches.append(spine)
+
+    net.addLink(spine_switches[0], dns_server)
+
 
     # ----- LEAF SWITCHES -----
     leaf_switches = []
@@ -66,6 +85,7 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
 
 
     net.start()
+    dns_server.popen(['ip', 'link', 'set', 'dns_server-eth0', 'up']).wait()
     # This will make sure that the REST server will be up
     # by the time we use it
     net.waitConnected()
@@ -82,7 +102,7 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
 
         return slices
 
-    slices = create_slices(net.hosts, num_slices)
+    slices = create_slices(list(filter(lambda host: host.name != "dns_server", net.hosts)), num_slices)
     print("\nDynamically created slices:", slices)
 
     # Save slices for the controller
@@ -187,6 +207,17 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
         cleanup()
         queues.clear_queues()
         return
+    
+    """
+    SERVICE DELETE TEST
+    """
+
+    request_result = requests.delete(f"http://{SERVER_IP}:{SERVER_PORT}/api/v0/service/0/remove")
+
+    if request_result.status_code != 200:
+        print(f"Service delete test failed with status {request_result.status_code}")
+
+    """"""
 
     # ----- ENVIRONMENTAL EVENTS -----
     def environmental_events():
