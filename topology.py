@@ -251,6 +251,61 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
         queues.clear_queues()
         return
 
+    # ----- SERVICE INITIALIZATION -----
+    print("\n*** Starting Services ***\n")
+    
+    # Web service on slice 0
+    web_server_ip = slices[0][0]
+    web_client_ip = slices[0][1]
+    
+    # Streaming service on slice 2
+    stream_server_ip = slices[2][0]
+    stream_client_ip = slices[2][1]
+    
+    # Find host objects
+    web_server_host = None
+    web_client_host = None
+    stream_server_host = None
+    stream_client_host = None
+    
+    for host in net.hosts:
+        if host.IP() == web_server_ip:
+            web_server_host = host
+        elif host.IP() == web_client_ip:
+            web_client_host = host
+        elif host.IP() == stream_server_ip:
+            stream_server_host = host
+        elif host.IP() == stream_client_ip:
+            stream_client_host = host
+    
+    print(f"Web Server: {web_server_host.name} ({web_server_ip})")
+    print(f"Web Client: {web_client_host.name} ({web_client_ip})")
+    print(f"Stream Server: {stream_server_host.name} ({stream_server_ip})")
+    print(f"Stream Client: {stream_client_host.name} ({stream_client_ip})")
+    
+    # Start web server
+    print(f"\nStarting web server on {web_server_host.name}...")
+    web_server_host.cmd('docker run -d --name web_server --network=host nginx:alpine')
+    
+    # Start streaming server
+    print(f"Starting stream server on {stream_server_host.name}...")
+    stream_server_host.cmd('docker run -d --name stream_server --network=host nginx:alpine')
+    
+    time.sleep(3)
+    
+    # Simulate streaming with a large file (100 MB)
+    print("Creating video file...")
+    stream_server_host.cmd('docker exec stream_server sh -c "dd if=/dev/zero of=/usr/share/nginx/html/video.dat bs=1M count=100 2>/dev/null"')
+    
+    # Start clients
+    print(f"Starting web client on {web_client_host.name}...")
+    web_client_host.cmd(f'while true; do curl -s http://{web_server_ip}:80 > /dev/null 2>&1; sleep 1; done &')
+    
+    print(f"Starting stream client on {stream_client_host.name}...")
+    stream_client_host.cmd(f'while true; do wget -q -O /dev/null http://{stream_server_ip}:80/video.dat 2>&1; sleep 0.1; done &')
+    
+    print("\n*** Services started ***\n")
+
     # ----- ENVIRONMENTAL EVENTS -----
     def environmental_events():
         while True:
@@ -291,6 +346,22 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
     net.stop()
     cleanup()
     queues.clear_queues()
+    
+    # Stop services clients
+    if web_client_host:
+        web_client_host.cmd('pkill -f "curl.*http://"')
+    
+    if stream_client_host:
+        stream_client_host.cmd('pkill -f "wget.*video.dat"')
+    
+    # Stop and remove server containers
+    if web_server_host:
+        web_server_host.cmd('docker stop web_server 2>/dev/null')
+        web_server_host.cmd('docker rm web_server 2>/dev/null')
+    
+    if stream_server_host:
+        stream_server_host.cmd('docker stop stream_server 2>/dev/null')
+        stream_server_host.cmd('docker rm stream_server 2>/dev/null')
 
 
 if __name__ == "__main__":
