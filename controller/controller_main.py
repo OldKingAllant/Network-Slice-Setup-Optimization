@@ -9,10 +9,13 @@ from ryu.lib.packet import ethernet
 from ryu.lib.packet import ether_types
 from ryu.lib.packet import lldp
 from ryu.lib import hub
+from threading import Lock
+
 
 from ryu.app import wsgi
 from ryu.app.wsgi import Request, Response
 
+import subprocess
 import logging
 import typing
 import json
@@ -77,6 +80,37 @@ class RestServer(wsgi.ControllerBase):
     """
     def __init__(self, req, link, data: typing.Dict, **config):
         super(RestServer, self).__init__(req, link, data, **config)
+
+    @route_handler(http_method="POST")
+    def handle_qos_update(self, req: Request, **_kwargs):
+        body = json.loads(req.body.decode())
+
+        required = ["queue_id", "min_bw", "max_bw"]
+        if not all(k in body for k in required):
+            return {"status": "E_MISSING_FIELDS"}, 400
+
+        app: SliceController = self.data['app']
+        app.update_queue(
+            int(body["queue_id"]),
+            float(body["min_bw"]),
+            float(body["max_bw"])
+        )
+
+        return {"status": "E_OK"}, 200
+
+
+    @route_handler(http_method="POST")
+    def handle_qos_queues(self, req: Request, **_kwargs):
+        body = json.loads(req.body.decode())
+        if "queue_uuids" not in body:
+            return {"status": "E_MISSING_QUEUE_UUIDS"}, 400
+
+        app: SliceController = self.data['app']
+        app.queue_uuids = {int(k): v for k, v in body["queue_uuids"].items()}
+
+        logger.info(f"[REST] Registered queue UUIDs: {app.queue_uuids}")
+        return {"status": "E_OK"}, 200
+
 
     @route_handler(http_method="POST")
     def handle_slices(self, req: Request, **_kwargs):
@@ -287,6 +321,9 @@ class SliceController(app_manager.RyuApp):
     }
 
     def __init__(self, *_args, **_kwargs):
+        self.queue_uuids: dict[int, str] = {}
+        self.qos_lock = Lock()
+
         super(SliceController, self).__init__(*_args, **_kwargs)
         # Data that needs to be shared with the REST server
         self.data: typing.Dict[str, typing.Any] = {}
@@ -320,6 +357,10 @@ class SliceController(app_manager.RyuApp):
         self.mapper.connect('/api/v0/service/:id/remove', controller=RestServer, action='handle_service_remove', conditions=dict(method=['DELETE']))
         self.mapper.connect('/api/v0/service/:id/clientadd/:clientip', controller=RestServer, action='handle_service_add_client', conditions=dict(method=['POST']))
         self.mapper.connect('/api/v0/service/:id/clientremove/:clientip', controller=RestServer, action='handle_service_remove_client', conditions=dict(method=['DELETE']))
+        
+        self.mapper.connect('/api/v0/qos/queues',controller=RestServer,action='handle_qos_queues',conditions=dict(method=['POST']))
+        self.mapper.connect('/api/v0/qos/update',controller=RestServer,action='handle_qos_update',conditions=dict(method=['POST']))
+
         self.wsgi.registory['RestServer'] = self.data
         self.data['graph'] = None
         self.data['app'] = self
@@ -328,6 +369,24 @@ class SliceController(app_manager.RyuApp):
 
         with open(COMMON_CONFIG_FILE) as conf_file:
             self.data['conf'] = json.load(conf_file)
+
+    def update_queue(self, queue_id: int, min_bw: float, max_bw: float):
+        if queue_id not in self.queue_uuids:
+            raise Exception(f"Queue {queue_id} not registered")
+
+        uuid = self.queue_uuids[queue_id]
+
+        with self.qos_lock:
+            subprocess.run([
+                "ovs-vsctl", "set", "queue", uuid,
+                f"other-config:min-rate={int(min_bw * 1e6)}",
+                f"other-config:max-rate={int(max_bw * 1e6)}"
+            ], check=True)
+
+        logger.info(
+            f"[QoS] Updated queue {queue_id}: min={min_bw}Mbps max={max_bw}Mbps"
+        )
+
 
     def add_flow(self, dp: Datapath, match_rule, instructions, prio=0x7FFF, cookie=0):
         """
