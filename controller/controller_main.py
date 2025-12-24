@@ -377,15 +377,38 @@ class SliceController(app_manager.RyuApp):
         uuid = self.queue_uuids[queue_id]
 
         with self.qos_lock:
+            # 1) update OVS
             subprocess.run([
                 "ovs-vsctl", "set", "queue", uuid,
                 f"other-config:min-rate={int(min_bw * 1e6)}",
                 f"other-config:max-rate={int(max_bw * 1e6)}"
             ], check=True)
 
+            # 2) update controller QoS state
+            self.data['qos'][queue_id]['min_bw'] = float(min_bw)
+            self.data['qos'][queue_id]['max_bw'] = float(max_bw)
+
         logger.info(
             f"[QoS] Updated queue {queue_id}: min={min_bw}Mbps max={max_bw}Mbps"
         )
+
+        # 3) remove affected routes
+        affected_paths = [
+            (begin, end)
+            for (begin, end), qos in list(self.path_qos.items())
+            if qos == queue_id
+        ]
+
+        for begin, end in affected_paths:
+            self.remove_route(
+                net_graph.NetHost(begin),
+                net_graph.NetHost(end),
+                True
+            )
+
+        # 4) reroute everything
+        self.attempt_rerouting()
+
 
 
     def add_flow(self, dp: Datapath, match_rule, instructions, prio=0x7FFF, cookie=0):
