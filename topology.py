@@ -84,7 +84,8 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
     for i in range(K):
         spine = net.addSwitch(f"s_spine_{i+1}", dpid=f"1{i+1:03d}", datapath='osvk', protocols='OpenFlow13')
         spine_switches.append(spine)
-        net.addLink(spine, dns_server)
+        
+    net.addLink(spine_switches[0], dns_server)
 
 
     # ----- LEAF SWITCHES -----
@@ -285,11 +286,11 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
     
     # Start web server
     print(f"\nStarting web server on {web_server_host.name}...")
-    web_server_host.cmd('docker run -d --name web_server --network=host nginx:alpine')
+    web_server_host.cmd('docker run -d --name web_server -p 80:80 nginx:alpine')
     
     # Start streaming server
     print(f"Starting stream server on {stream_server_host.name}...")
-    stream_server_host.cmd('docker run -d --name stream_server --network=host nginx:alpine')
+    stream_server_host.cmd('docker run -d --name stream_server -p 80:4380 nginx:alpine')
     
     time.sleep(3)
     
@@ -302,7 +303,7 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
     web_client_host.cmd(f'while true; do curl -s http://{web_server_ip}:80 > /dev/null 2>&1; sleep 1; done &')
     
     print(f"Starting stream client on {stream_client_host.name}...")
-    stream_client_host.cmd(f'while true; do wget -q -O /dev/null http://{stream_server_ip}:80/video.dat 2>&1; sleep 0.1; done &')
+    stream_client_host.cmd(f'while true; do wget -q -O /dev/null http://{stream_server_ip}:4380/video.dat 2>&1; sleep 0.1; done &')
     
     print("\n*** Services started ***\n")
 
@@ -343,10 +344,6 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
     #print(f"Delete zone: {dns_conn.delete_zone('service.mn')}")
     #del dns_conn
 
-    net.stop()
-    cleanup()
-    queues.clear_queues()
-    
     # Stop services clients
     if web_client_host:
         web_client_host.cmd('pkill -f "curl.*http://"')
@@ -362,6 +359,10 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
     if stream_server_host:
         stream_server_host.cmd('docker stop stream_server 2>/dev/null')
         stream_server_host.cmd('docker rm stream_server 2>/dev/null')
+
+    net.stop()
+    cleanup()
+    queues.clear_queues()
 
 
 if __name__ == "__main__":

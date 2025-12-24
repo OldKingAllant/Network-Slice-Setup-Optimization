@@ -108,7 +108,9 @@ def load_queues(qos_file: str, switches: List[Tuple[str, OVSSwitch]], controller
             logging.error('Load queues: vsctl returned too few lines')
             return False
         print(f"QoS UUID: {result[0]}")
-        
+
+        queue_uuids = {f"{queue_id}": result[queue_id+1] for queue_id in range(len(qos))}
+        print(queue_uuids)
         
         for switch in switches:
             print(f'Load queue: switch {switch.dpid}')
@@ -159,6 +161,9 @@ def load_queues(qos_file: str, switches: List[Tuple[str, OVSSwitch]], controller
     requests.post(f'http://{controller_ip}:{controller_port}/api/v0/qos', 
                   headers={'ContentType': 'application/json'},
                   json=qos)
+    requests.post(f"http://{controller_ip}:{controller_port}/api/v0/qos/queues", 
+                  headers={'ContentType': 'application/json'},
+                  json={"queue_uuids": queue_uuids})
     return True
 
 def clear_queues():
@@ -182,3 +187,26 @@ def clear_queues():
         return False
     clear_queue = subprocess.Popen(['ovs-vsctl', '--all', 'destroy', 'queue'])
     return clear_queue.wait() == 0
+
+def change_qos_parameters(qos_id: int, min_bw: str, max_bw: str, controller_ip: str, controller_port: int):
+    #["queue_id", "min_bw", "max_bw"]
+    result = requests.post(f"http://{controller_ip}:{controller_port}/api/v0/qos/update", 
+                  headers={'ContentType': 'application/json'},
+                  json={"queue_id": qos_id, "min_bw": min_bw, "max_bw": max_bw})
+    if result.status_code != 200:
+        print(f"QoS update error, status code {result.status_code}, body: {result.json()}")
+        return False 
+    return True
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(prog='Queues',
+                    description='Change queue parameters')
+    parser.add_argument("--id", required=True)
+    parser.add_argument("--max_bw", required=True)
+    parser.add_argument("--min_bw", required=True)
+    parser.add_argument("--ip", default="127.0.0.1")
+    parser.add_argument("--port", default=8080)
+    args = parser.parse_args()
+    print(f"Queue id: {args.id}, Max bw: {args.max_bw}, Min bw: {args.min_bw}, IP: {args.ip}, Port: {args.port}")
+    change_qos_parameters(args.id, args.min_bw, args.max_bw, args.ip, args.port)
