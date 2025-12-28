@@ -71,3 +71,26 @@ sudo mn -c
 docker stop $(docker ps -aq)
 docker rm $(docker ps -aq)
 ```
+
+# TODO
+1. Communicate service creation to the controller (by giving service domain name?)
+2. Add methods to subscribe/unsubscribe an host from a service
+3. Controller evaluates service quality and whether to migrate
+4. Migration
+
+# Controller services
+* GET /api/v0/service/list: Returns list of all services
+* POST /api/v0/service/create: Create new service
+* DELETE /api/v0/service/:id/remove: Remove specific service
+
+# New service creation
+In the request's body, put the following dict:
+- "domain": Domain of the service
+- "subscriber": IP of the user
+- "qos": Index of QoS used by the service
+- "type": Type of the service
+
+Will return a dictionary with:
+- "status": E_OK if return status is 200
+- "service_id": ID of the new service
+- "service_ip": Current IP of the service

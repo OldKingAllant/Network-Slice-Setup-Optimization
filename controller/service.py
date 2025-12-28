@@ -41,6 +41,12 @@ class ServiceList:
     
     def get_service_by_id(self, id: int) -> Optional[Service]:
         services_with_id = list(filter(lambda service: service.id == id, self.services))
-        if len(services_with_id):
+        if len(services_with_id) == 0:
             return None 
         return services_with_id[0]
+    
+    def add_service(self, new_service: Service):
+        services_with_domain = list(filter(lambda service: service.domain == new_service.domain, self.services))
+        if len(services_with_domain) != 0:
+            return False 
+        self.services.append(new_service)
