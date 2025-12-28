@@ -25,6 +25,7 @@ import net_graph
 
 from stats_monitor import StatsMonitor
 from service import Service, ServiceList
+import dns_api
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -312,7 +313,8 @@ class RestServer(wsgi.ControllerBase):
         app: SliceController = self.data['app']
         with app.service_lock:
             services = copy.deepcopy(app.services)
-        if services.get_service_by_id(_kwargs["id"]) == None:
+        logger.info(f"[REST] Attempt removing service {_kwargs['id']}")
+        if services.get_service_by_id(int(_kwargs["id"])) == None:
             return {'status': 'E_INV_SERVICE'}, 403
         app: SliceController = self.data['app']
         result = app.remove_service(int(_kwargs['id']))
@@ -399,6 +401,8 @@ class SliceController(app_manager.RyuApp):
 
         with open(COMMON_CONFIG_FILE) as conf_file:
             self.data['conf'] = json.load(conf_file)
+
+        self.dns_conn: typing.Optional[dns_api.DNSServer] = None
 
     def update_queue(self, queue_id: int, min_bw: float, max_bw: float):
         if queue_id not in self.queue_uuids:
@@ -684,7 +688,7 @@ class SliceController(app_manager.RyuApp):
                     if not success:
                         logger.info(f'{host} -> {other_host} not possible')
                 self.create_route(net_graph.NetHost(host), net_graph.NetHost(dns_ip), self.data['default_qos'], True)
-
+        self.dns_conn = dns_api.DNSServer.connect('admin', 'admin', f"127.0.0.1:{self.data['conf']['dns_api_port']}")
         return
     
     @set_ev_cls(ShutdownEvent, MAIN_DISPATCHER)
@@ -704,6 +708,8 @@ class SliceController(app_manager.RyuApp):
         self.path_qos.clear()
         stat_monitor: StatsMonitor = self.data['stat_monitor']
         stat_monitor.stop_monitor()
+        del self.dns_conn
+        self.dns_conn = None
 
 
     def attempt_rerouting(self):
@@ -965,6 +971,8 @@ class SliceController(app_manager.RyuApp):
                 if possible_path != None:
                     selected_host = host
                     break 
+
+            use_best_effort = False
             
             if possible_path == None:
                 logger.warning("[CONTROLLER] Could not find host that satisfies QoS")
@@ -984,6 +992,7 @@ class SliceController(app_manager.RyuApp):
                 all_paths = sorted(all_paths, key=lambda entry: sum(map(lambda link: link.delay, entry[2])))
                 selected_host = all_paths[0][0]
                 possible_path = all_paths[0][2]
+                use_best_effort = True
 
             if possible_path != None:
                 logger.info(f"[CONTROLLER] Selected host: {selected_host}")
@@ -992,13 +1001,28 @@ class SliceController(app_manager.RyuApp):
                     logger.info("[CONTROLLER] Path already exists with required QoS, not changing")
                 else:
                     self.remove_route(net_graph.NetHost(selected_host), net_graph.NetHost(service.subscriber), True)
-                    if not self.create_route(net_graph.NetHost(selected_host), net_graph.NetHost(service.subscriber), qos, False):
+                    if not self.create_route(net_graph.NetHost(selected_host), net_graph.NetHost(service.subscriber), qos, use_best_effort):
                         logger.error("[CONTROLLER] Unexpected, could not create route")
                         return None
                 service.curr_ip = selected_host
             else:
                 logger.error("[CONTROLLER] Could not find host")
                 return None
+            
+            zone_name = '.'.join(service.domain.split('.')[1:])
+            logger.info(f"[CONTROLLER] Possible zone name: {zone_name}")
+            result = self.dns_conn.create_zone_for_net(zone_name)
+            if isinstance(result, str):
+                logger.warning(f"[CONTROLLER] Create zone failed: {result}")
+            else:
+                logger.info("[CONTROLLER] Zone created")
+
+            result = self.dns_conn.add_record(service.domain, zone_name, 3600, service.curr_ip)
+            if isinstance(result, str):
+                logger.error(f"[CONTROLLER] Add record to DNS failed: {result}")
+                return None
+            else:
+                logger.info("[CONTROLLER] New DNS record added")
             
             errored = False
             try:
@@ -1014,8 +1038,46 @@ class SliceController(app_manager.RyuApp):
         return service
     
     def remove_service(self, id: int) -> bool:
+        service_file_path: str = self.data['conf']['service_list_file']
+        logger.info(f"[CONTROLLER] Remove service with ID {id}")
         with self.service_lock:
+            service = self.services.get_service_by_id(id)
+            if service == None:
+                logger.error("[CONTROLLER] Service does not exist")
+                return False
+            begin = service.curr_ip
+            end = service.subscriber
+
+            qos = self.data['default_qos']
+
+            if ((begin, end) in self.created_paths and self.path_qos[(begin, end)] == qos) or \
+                ((end, begin) in self.created_paths and self.path_qos[(end, begin)] == qos):
+                logger.info("[CONTROLLER] Path already uses default QoS, skip update")
+            else:
+                self.remove_route(net_graph.NetHost(begin), net_graph.NetHost(end), True)
+                success = self.create_route(net_graph.NetHost(begin), net_graph.NetHost(end), qos, False)
+                if not success:
+                    success = self.create_route(net_graph.NetHost(begin), net_graph.NetHost(end), qos, True)
+                if not success:
+                    logger.error(f'{begin} -> {end} not possible')
+
+            zone_name = '.'.join(service.domain.split('.')[1:])
+            logger.info(f"[CONTROLLER] Possible zone name: {zone_name}")
+            logger.info(f"[CONTROLLER] Remove record with ip: {service.curr_ip}")
+
+            result = self.dns_conn.delete_record(service.domain, zone_name, service.curr_ip)
+            if isinstance(result, str):
+                logger.error(f"[CONTROLLER] Remove DNS record failed: {result}")
+            else:
+                logger.info("[CONTROLLER] DNS record removed")
+
             result = self.services.remove_service_by_id(id)
             if not result:
+                logger.error("[CONTROLLER] Remove failed")
                 return False 
+            try:
+                self.services.dump(service_file_path)
+            except:
+                logger.error("[CONTROLLER] File update failed")
+                return False
         return True

@@ -116,7 +116,7 @@ class DNSServer:
         except:
             logger.error(traceback.format_exc())
             return "Exception occurred"
-        return request_result.json()["response"]["domain"]
+        return request_result.json()["response"]
     
     def delete_zone(self, name: str):
         old_zones = self.get_zones()
