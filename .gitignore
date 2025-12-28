@@ -2,3 +2,4 @@ dns_docker/containernet/*
 logs/*
 config/dns_config/logs/*
 .DS_Store
+config/services.obj

@@ -629,6 +629,8 @@ class SliceController(app_manager.RyuApp):
         if self.created_paths[(begin.ip, end.ip)] != None:
             if (begin.ip, end.ip) in self.unrouted_paths:
                 del self.unrouted_paths[(begin.ip, end.ip)]
+            if (end.ip, begin.ip) in self.unrouted_paths:
+                del self.unrouted_paths[(end.ip, begin.ip)]
             self.path_cookies[(begin.ip, end.ip)] = []
             self.create_route_flows(self.created_paths[(begin.ip, end.ip)], begin, end, qos, self.path_cookies[(begin.ip, end.ip)])
         else:
@@ -932,7 +934,88 @@ class SliceController(app_manager.RyuApp):
     #2. Set DNS entry
     #3. Save to file
     #Use lock to manage routes?
-        return None        
+        service_file_path: str = self.data['conf']['service_list_file']
+        if not 'qos' in self.data:
+            logger.error("[CONTROLLER] Net not available")
+            return None
+        qos_config: list[typing.Dict[str, typing.Any]] = self.data['qos']
+        qos = service.qos_index
+        with self.service_lock:
+            if not 'slices' in self.data or not 'graph' in self.data:
+                logger.error("[CONTROLLER] Net not available")
+                return None
+            slices: typing.Dict[str, typing.List[str]] = self.data['slices']
+            rem_slice = dict(filter(lambda the_slice: service.subscriber in the_slice[1], slices.items()))
+            if len(rem_slice) != 1:
+                logger.error("[CONTROLLER] Could not create service, subscriber ip does not exist")
+                return None
+            slice_id = list(rem_slice.keys())[0]
+            possible_hosts = list(filter(lambda ip: ip != service.subscriber, slices[slice_id]))
+            logger.info(f"[CONTROLLER] Service slice id: {slice_id}")
+            logger.info(f"[CONTROLLER] Possible hosts: {possible_hosts}")
+            if len(possible_hosts) == 0:
+                logger.error("[CONTROLLER] Could not create service, no available hosts")
+                return None
+            service.slice = slice_id
+            graph: net_graph.NetGraph = self.data['graph']
+            for host in possible_hosts:
+                possible_path = graph.find_path(net_graph.NetHost(host), net_graph.NetHost(service.subscriber), opt="hops", max_delay=qos_config[qos]["max_delay"], 
+                                                   min_bw=qos_config[qos]['min_bw'], ignore_cache=True, keep_cache=True,
+                                                   old_path=self.created_paths[(host, service.subscriber)])
+                if possible_path != None:
+                    selected_host = host
+                    break 
+            
+            if possible_path == None:
+                logger.warning("[CONTROLLER] Could not find host that satisfies QoS")
+                all_paths: list[tuple[str, str, list[net_graph.NetLink]]] = []
+                for host in possible_hosts:
+                    possible_path = graph.find_path(net_graph.NetHost(host), net_graph.NetHost(service.subscriber), opt="hops", 
+                                                   ignore_cache=True, keep_cache=True,
+                                                   old_path=self.created_paths[(host, service.subscriber)])
+                    if possible_path != None:
+                        all_paths.append((host, service.subscriber, possible_path))
+                if len(all_paths) == 0:
+                    logger.error("[CONTROLLER] Could not find valid host")
+                    return None
+                all_paths = sorted(all_paths, key=lambda entry: min(entry[2], key=lambda link: link.bw), reverse=True)
+                max_bw = max(all_paths[0][2], key=lambda link: link.bw).bw
+                all_paths = list(filter(lambda entry: min(entry[2], key=lambda link: link.bw).bw == max_bw, all_paths))
+                all_paths = sorted(all_paths, key=lambda entry: sum(map(lambda link: link.delay, entry[2])))
+                selected_host = all_paths[0][0]
+                possible_path = all_paths[0][2]
+
+            if possible_path != None:
+                logger.info(f"[CONTROLLER] Selected host: {selected_host}")
+                if ((selected_host, service.subscriber) in self.created_paths and self.path_qos[(selected_host, service.subscriber)] == qos) \
+                    or ((service.subscriber, selected_host) in self.created_paths and self.path_qos[(service.subscriber, selected_host)] == qos):
+                    logger.info("[CONTROLLER] Path already exists with required QoS, not changing")
+                else:
+                    self.remove_route(net_graph.NetHost(selected_host), net_graph.NetHost(service.subscriber), True)
+                    if not self.create_route(net_graph.NetHost(selected_host), net_graph.NetHost(service.subscriber), qos, False):
+                        logger.error("[CONTROLLER] Unexpected, could not create route")
+                        return None
+                service.curr_ip = selected_host
+            else:
+                logger.error("[CONTROLLER] Could not find host")
+                return None
+            
+            errored = False
+            try:
+                result = self.services.add_service(copy.deepcopy(service))
+                self.services.dump(service_file_path)
+            except:
+                logger.exception("Exception occurred")
+                errored = True
+            
+            if errored or not result:
+                logger.error("[CONTROLLER] Could not create service, cannot add to list")
+                return None
+        return service
     
     def remove_service(self, id: int) -> bool:
-        return False
+        with self.service_lock:
+            result = self.services.remove_service_by_id(id)
+            if not result:
+                return False 
+        return True
