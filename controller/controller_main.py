@@ -290,7 +290,7 @@ class RestServer(wsgi.ControllerBase):
         is_ok = all(type(body[param]) == required_type for param, required_type in zip(required, wanted_types))
         if not is_ok:
             return {'status': 'E_INV_PARAMS'}, 400
-        the_service = Service(body['domain'], body['subscriber'], body['qos'], body['type'])
+        the_service = Service(body['domain'], body['subscriber'], body['qos'], body['service_type'])
         app: SliceController = self.data['app']
         result = app.add_service(the_service)
         if result == None:
@@ -348,6 +348,102 @@ class SliceController(app_manager.RyuApp):
         'dpset': dpset.DPSet
     }
 
+    SERVICE_QOS_INTERVAL = 10  # seconds
+
+    def _service_qos_loop(self):
+        while True:
+            hub.sleep(SERVICE_QOS_INTERVAL)
+            self.evaluate_services_qos()
+
+    def evaluate_services_qos(self):
+        if not hasattr(self, "paths_without_qos"):
+            return
+
+        with self.service_lock:
+            services = copy.deepcopy(self.services.services)
+
+        for service in services:
+            self.check_single_service(service)
+
+    def check_single_service(self, service: Service):
+        if service.curr_ip is None:
+            return
+
+        begin = service.curr_ip
+        end = service.subscriber
+
+        degraded = (
+            (begin, end) in self.paths_without_qos or
+            (end, begin) in self.paths_without_qos
+        )
+
+        if not degraded:
+            self.reset_service_violations(service)
+            return
+
+        logger.warning(f"[SERVICE] QoS degraded for {service.domain}")
+        self.handle_qos_violation(service)
+
+    def handle_qos_violation(self, service: Service):
+        with self.service_lock:
+            stored = self.services.get_service_by_id(service.id)
+            if stored is None:
+                return
+
+            stored.qos_violations += 1
+            self.services.dump(self.data['conf']['service_list_file'])
+
+        if stored.qos_violations == 1:
+            logger.info(f"[SERVICE] Trying QoS tuning for {service.domain}")
+            self.try_improve_queue(stored.qos_index)
+            return
+
+        if not stored.migratable:
+            logger.info(f"[SERVICE] {service.domain} high priority → no migration")
+            return
+
+        if stored.qos_violations >= 3:
+            logger.warning(f"[SERVICE] {service.domain} will be migrated")
+            self.mark_service_for_migration(stored)
+
+
+
+    def try_improve_queue(self, qos_index: int):
+        qos = self.data['qos'][qos_index]
+        new_max = qos['max_bw'] * 1.2
+
+        try:
+            self.update_queue(qos_index, qos['min_bw'], new_max)
+        except Exception:
+            logger.error("[QoS] Queue update failed")
+
+
+    def mark_service_for_migration(self, service: Service):
+        with self.service_lock:
+            stored = self.services.get_service_by_id(service.id)
+            if stored is None:
+                return
+
+            stored.qos_violations = 0
+
+            stored.curr_ip = None
+            stored.slice = None
+
+            logger.info(
+                f"[SERVICE] {stored.domain} marked for migration (file update only)"
+            )
+
+            self.services.dump(self.data['conf']['service_list_file'])
+
+    def reset_service_violations(self, service: Service):
+        with self.service_lock:
+            stored = self.services.get_service_by_id(service.id)
+            if stored and stored.qos_violations != 0:
+                stored.qos_violations = 0
+                self.services.dump(self.data['conf']['service_list_file'])
+
+
+
     def __init__(self, *_args, **_kwargs):
         self.queue_uuids: dict[int, str] = {}
         self.qos_lock = Lock()
@@ -398,6 +494,7 @@ class SliceController(app_manager.RyuApp):
         self.data['app'] = self
         self.data['stat_monitor'] = StatsMonitor()
         self.route_opt_thread = hub.spawn(self._route_reevaluate_loop)
+        self.service_qos_thread = hub.spawn(self._service_qos_loop)
 
         with open(COMMON_CONFIG_FILE) as conf_file:
             self.data['conf'] = json.load(conf_file)

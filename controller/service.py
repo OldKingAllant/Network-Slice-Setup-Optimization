@@ -2,7 +2,7 @@ import pickle
 import argparse
 import os
 
-from typing import Optional, Any
+from typing import Optional, Any, Tuple
 
 """
 1. Domain name
@@ -26,9 +26,47 @@ class Service:
         self.id = Service.service_id
         Service.service_id += 1
 
+        self.qos_violations: int = 0
+
+        if service_type == "streaming":
+            self.priority = 10
+            self.migratable = False
+        elif service_type == "browsing":
+            self.priority = 1
+            self.migratable = True
+        else:
+            self.priority = 0
+            self.migratable = True
+
+
     def __str__(self):
-        as_dict = {"id": self.id, "domain": self.domain, "subscriber": self.subscriber, "qos": self.qos_index, "type": self.service_type, "ip": self.curr_ip}
+        as_dict = {
+            "id": self.id,
+            "domain": self.domain,
+            "subscriber": self.subscriber,
+            "qos": self.qos_index,
+            "type": self.service_type,
+            "ip": self.curr_ip,
+            "violations": self.qos_violations,
+            "migratable": self.migratable,
+            "priority": self.priority
+        }
         return f"{as_dict}"
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+        if not hasattr(self, "qos_violations"):
+            self.qos_violations = 0
+
+        if not hasattr(self, "migratable"):
+            self.migratable = True
+
+        if not hasattr(self, "priority"):
+            self.priority = 0
+
+        if not hasattr(self, "slice"):
+            self.slice = None
 
 class ServiceList:
     def __init__(self):
@@ -63,7 +101,7 @@ class ServiceList:
         self.services = list(filter(lambda service: service.id != id, self.services))
         return True
     
-def add_service(domain: str, subscriber: str, qos: int, type: str, controller_ip: str, controller_port: int) -> tuple[Optional[Any], Optional[Any]]:
+def add_service(domain: str, subscriber: str, qos: int, service_type: str, controller_ip: str, controller_port: int) -> Tuple[Optional[Any], Optional[Any]]:
     import requests
     """
     "domain": Domain of the service
@@ -72,12 +110,12 @@ def add_service(domain: str, subscriber: str, qos: int, type: str, controller_ip
     "type": Type of the service
     """
     response = requests.post(f"http://{controller_ip}:{controller_port}/api/v0/service/create", headers={'ContentType': 'application/json'}, 
-                             json={"domain": domain, "subscriber": subscriber, "qos": qos, "type": type})
+                            json={"domain": domain, "subscriber": subscriber, "qos": qos, "service_type": service_type})
     if response.status_code != 200:
         return None, response.json()
     return response.json(), None
 
-def remove_service(service_id: int, controller_ip: str, controller_port: int) -> tuple[Optional[Any], Optional[Any]]:
+def remove_service(service_id: int, controller_ip: str, controller_port: int) -> Tuple[Optional[Any], Optional[Any]]:
     import requests
     response = requests.delete(f"http://{controller_ip}:{controller_port}/api/v0/service/{service_id}/remove", 
                                headers={'ContentType': 'application/json'})
@@ -91,12 +129,12 @@ if __name__ == "__main__":
     parser.add_argument("--domain", required=True)
     parser.add_argument("--sub", required=True)
     parser.add_argument("--qos", required=True)
-    parser.add_argument("--type", required=True)
+    parser.add_argument("--service_type", required=True)
     parser.add_argument("--ip", default="127.0.0.1")
     parser.add_argument("--port", default=8080)
     args = parser.parse_args()
-    print(f"Domain: {args.domain}, Subsrciber: {args.sub}, QoS: {args.qos}, Type: {args.type}")
-    result = add_service(args.domain, args.sub, int(args.qos), args.type, args.ip, int(args.port))
+    print(f"Domain: {args.domain}, Subsrciber: {args.sub}, QoS: {args.qos}, Type: {args.service_type}")
+    result = add_service(args.domain, args.sub, int(args.qos), args.service_type, args.ip, int(args.port))
     if result[1] == None:
         print(f"OK: {result[0]}")
     else:
