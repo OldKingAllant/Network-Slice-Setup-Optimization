@@ -73,10 +73,10 @@ docker rm $(docker ps -aq)
 ```
 
 # TODO
-1. Communicate service creation to the controller (by giving service domain name?)
-2. Add methods to subscribe/unsubscribe an host from a service
-3. Controller evaluates service quality and whether to migrate
-4. Migration
+1. Controller evaluates service quality and whether to migrate
+2. If a service is unreachable from its user, migrate it
+3. In the controller, when marking a service for migration, effectively find a new ip and modify the DNS accordingly
+4. Migration (topology side)
 
 # Controller services
 * GET /api/v0/service/list: Returns list of all services
