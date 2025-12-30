@@ -22,6 +22,8 @@ import queues
 from subprocess import Popen, PIPE
 from controller.dns_api import DNSServer
 
+from pathlib import Path
+
 SERVER_IP = '127.0.0.1'
 SERVER_PORT = 8080
 
@@ -413,6 +415,10 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
     mgr.stop()
     cleanup()
     queues.clear_queues()
+
+    for zone in Path("./config/dns_config/zones/").glob("*"):
+        print(f"Removing DNS zone {str(zone)}")
+        zone.unlink()
 
 
 if __name__ == "__main__":
