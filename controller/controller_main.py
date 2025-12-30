@@ -352,7 +352,7 @@ class SliceController(app_manager.RyuApp):
 
     def _service_qos_loop(self):
         while True:
-            hub.sleep(SERVICE_QOS_INTERVAL)
+            hub.sleep(SliceController.SERVICE_QOS_INTERVAL)
             self.evaluate_services_qos()
 
     def evaluate_services_qos(self):
@@ -1099,7 +1099,10 @@ class SliceController(app_manager.RyuApp):
                 logger.error("[CONTROLLER] Could not create service, subscriber ip does not exist")
                 return None
             slice_id = list(rem_slice.keys())[0]
-            possible_hosts = list(filter(lambda ip: ip != service.subscriber, slices[slice_id]))
+            used_hosts = set(filter(lambda ip: ip != None, map(lambda service: service.curr_ip, self.services.services)))
+            used_hosts = used_hosts.union(map(lambda service: service.subscriber, self.services.services))
+            logger.info(f"[CONTROLLER] Used hosts: {used_hosts}")
+            possible_hosts = list(filter(lambda ip: ip != service.subscriber and not ip in used_hosts, slices[slice_id]))
             logger.info(f"[CONTROLLER] Service slice id: {slice_id}")
             logger.info(f"[CONTROLLER] Possible hosts: {possible_hosts}")
             if len(possible_hosts) == 0:
