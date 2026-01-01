@@ -26,6 +26,8 @@ import docker
 
 from pathlib import Path
 
+from typing import Dict, Any
+
 SERVER_IP = '127.0.0.1'
 SERVER_PORT = 8080
 
@@ -112,7 +114,7 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
             host = net.addDockerHost(
                 f"h{len(net.hosts) + 1}",
                 dimage="dev_test",
-                docker_args={"hostname": f"h{len(net.hosts) + 1}"}
+                docker_args={"hostname": f"h{len(net.hosts) + 1}", "dns": [common_config['dns_ip']]}
             )
             net.addLink(host, leaf, custom_bw="50")
 
@@ -121,28 +123,6 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
     # This will make sure that the REST server will be up
     # by the time we use it
     net.waitConnected()
-
-    #try:
-    #    dns_url = f"127.0.0.1:{common_config['dns_api_port']}"
-    #    dns_conn: DNSServer = DNSServer.connect("admin", "admin", dns_url)
-    #except:
-    #    import traceback
-    #    traceback.print_exc()
-    #    print(f"DNS login failed")
-    #    net.stop()
-    #    cleanup()
-    #    return
-    #
-    #if not isinstance(dns_conn, DNSServer):
-    #    print(f"DNS login failed")
-    #    net.stop()
-    #    cleanup()
-    #    return
-    #
-    #print(f"DNS session token: {dns_conn.token}")
-    #print(f"Create zone: {dns_conn.create_zone_for_net('service.mn')}")
-    #print(f"Add record: {dns_conn.add_record('0.service.mn', 'service.mn', 3600, '10.0.0.1')}")
-    #print(f"Records: {dns_conn.get_zone_records('service.mn')}")
 
     # ----- DYNAMIC SLICE CREATION -----
     def create_slices(hosts, num_slices):
@@ -391,24 +371,28 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
     
     # Start client services
     print("\nStarting client services...")
-    web_client_host.cmd(f'while true; do curl -s http://{web_server_ip}:80 > /dev/null 2>&1; sleep 1; done &')
-    stream_client_host.cmd(f'while true; do curl -s -o /dev/null http://{stream_server_ip}:80/video.dat 2>&1; sleep 2; done &')
+    web_client_host.cmd(f'while true; do curl -s http://web.service.mn:80 > /dev/null 2>&1; sleep 1; done &')
+    stream_client_host.cmd(f'while true; do curl -s -o /dev/null http://stream.service.mn:80/video.dat 2>&1; sleep 2; done &')
     
     print("\n*** Services started ***\n")
 
     # ----- SERVICE MIGRATION LOOP -----
-    service_locations = {}
+    service_locations: Dict[str, Any] = {}
     if web_service_id is not None:
         service_locations[web_service_id] = {
             'container_name': 'web_server',
             'current_ip': web_server_ip,
-            'current_host': web_server_host
+            'current_host': web_server_host,
+            'client_ip': web_client_ip,
+            'client_host': web_client_host
         }
     if stream_service_id is not None:
         service_locations[stream_service_id] = {
             'container_name': 'stream_server',
             'current_ip': stream_server_ip,
-            'current_host': stream_server_host
+            'current_host': stream_server_host,
+            'client_ip': stream_client_ip,
+            'client_host': stream_client_host
         }
 
     # Monitor services.obj and migrate containers when controller updates service IPs
@@ -443,7 +427,7 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
                     
                     # Check if migration is needed
                     if new_ip and new_ip != current_location['current_ip']:
-                        print(f"\n*** MGRATION REQUEST DETECTED for service {service.id} ({service.domain}) ***")
+                        print(f"\n*** MIGRATION REQUEST DETECTED for service {service.id} ({service.domain}) ***")
                         print(f"Current IP: {current_location['current_ip']} -> New IP: {new_ip}")
                         
                         # Find the new host for this IP
@@ -486,6 +470,11 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
                             # Update dictionary
                             service_locations[service.id]['current_ip'] = new_ip
                             service_locations[service.id]['current_host'] = new_host
+
+                            #client_ip: str = service_locations[service.id]['client_ip']
+                            #print(f"Flushing DNS cache for client {client_ip}")
+                            #client_host: DockerHost = service_locations[service.id]['client_host']
+                            #client_host.cmd("systemd-resolve --flush-caches")
                             
                             print(f"*** MIGRATION COMPLETED for service {service.id} ***\n")
                             
@@ -531,11 +520,6 @@ def scalable_topology(K=3, T=20, auto_recover=True, num_slices=3):
         headers={'ContentType': 'application/json'},
         json={}
     )
-
-    #print(f"Update DNS record: {dns_conn.update_record('0.service.mn', 'service.mn', '10.0.0.1', '10.0.0.2')}")
-    #print(f"Remove DNS record: {dns_conn.delete_record('0.service.mn', 'service.mn', '10.0.0.2')}")
-    #print(f"Delete zone: {dns_conn.delete_zone('service.mn')}")
-    #del dns_conn
 
     # Stop services clients
     if web_client_host:
