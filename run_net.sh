@@ -10,11 +10,12 @@ rm -rf config/dns_config/zones/*
 
 # Run topology
 echo "Running topology..."
+SCENARIO=${1:-default}
 if ! command -v python3.9 >/dev/null 2>&1
 then
-    sudo python3 ./topology.py
+    sudo python3 ./topology.py $SCENARIO
 else
-    sudo python3.9 ./topology.py
+    sudo python3.9 ./topology.py $SCENARIO
 fi
 
 # Cleanup

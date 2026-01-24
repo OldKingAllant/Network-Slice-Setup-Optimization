@@ -42,7 +42,7 @@ def get_port_no(intf):
         return int(intf.name.split('eth')[-1])
 
 
-def scalable_topology(K=2, T=20, auto_recover=True, num_slices=2):
+def scalable_topology(K=2, T=20, auto_recover=True, num_slices=2, scenario="default"):
     """
     Spine–leaf topology with redundancy and dynamic slice creation:
     - K spine switches
@@ -50,6 +50,7 @@ def scalable_topology(K=2, T=20, auto_recover=True, num_slices=2):
     - K hosts per leaf
     - each leaf is connected to all spines
     - every T seconds a random spine–leaf link fails
+    - scenario: type of traffic to generate ("default", "iperf", "custom")
     """
     docker_img_ls = Popen(['docker image ls | grep dns-mn'], shell=True, stdout=PIPE, stderr=PIPE)
     exit_status = docker_img_ls.wait()
@@ -109,7 +110,7 @@ def scalable_topology(K=2, T=20, auto_recover=True, num_slices=2):
              net.addLink(spine, leaf, delay="5ms", custom_bw="100")
 
         # Add hosts as DockerHost
-        for _ in range(K):
+        for _ in range(2 * K):
             #host = net.addHost(f"h{len(net.hosts) + 1}")
             host = net.addDockerHost(
                 f"h{len(net.hosts) + 1}",
@@ -403,13 +404,90 @@ def scalable_topology(K=2, T=20, auto_recover=True, num_slices=2):
         f'  fi; '
         f'done &'
     )
+
+    # Traffic generation based on scenario
+    if scenario == "iperf_web":
+        print(f"\n*** Scenario: {scenario} - Starting iperf3 traffic ***")
+        
+        # Find available hosts, excluding server e client web
+        available_hosts = []
+        for ip in slices[0]:
+            if ip != web_server_ip and ip != web_client_ip:
+                for h in net.hosts:
+                    if h.IP() == ip:
+                        available_hosts.append(h)
+                        break
+        
+        # Take a random host from the available ones
+        if available_hosts:
+            iperf_client_host = random.choice(available_hosts)
+            web_server_host.cmd('iperf3 -s &')
+            time.sleep(1)
+            iperf_client_host.cmd(f'iperf3 -c {web_server_ip} -b 50M -t 360 &')
+            print(f"iperf3 client running on {iperf_client_host.name} ({iperf_client_host.IP()})")
+        else:
+            print("WARNING: No available host for iperf3 client in slice 0")
     
-    # Start iperf3 traffic between web client and web server
-    print("\nInjecting iperf3 traffic...")
-    web_server_host.cmd('iperf3 -s &')
-    time.sleep(1)
-    web_client_host.cmd(f'iperf3 -c {web_server_ip} -b 50M -t 180 &')
-    
+    elif scenario == "env_events":
+        print(f"\n*** Scenario: {scenario} - Starting environmental events ***")
+        
+        def run_events():
+            T = 2  # delay between events
+            auto_recover = True
+            while True:
+                time.sleep(T)
+                print("\nAlessandro did this")
+                
+                leaf = random.choice(leaf_switches)
+                spine = random.choice(spine_switches)
+
+                links = net.linksBetween(spine, leaf)
+                if not links:
+                    print(f"No link between {spine.name} and {leaf.name}, skipping event")
+                    continue
+                link = links[0]
+
+                net.configLinkStatus(spine.name, leaf.name, "down")
+
+                if auto_recover:
+                    time.sleep(T)
+                    net.configLinkStatus(spine.name, leaf.name, "up")
+
+        # Run the events in a single background thread
+        threading.Thread(target=run_events, daemon=True).start()
+        print("Environmental events running in background")
+        
+    elif scenario == "iperf_stream":
+        print(f"\n*** Scenario: {scenario} - Starting iperf3 traffic ***")
+        
+        # Find available hosts, excluding server e client stream
+        available_hosts = []
+        for ip in slices[1]:
+            if ip != stream_server_ip and ip != stream_client_ip:
+                for h in net.hosts:
+                    if h.IP() == ip:
+                        available_hosts.append(h)
+                        break
+        
+        # Take a random host from the available ones
+        if available_hosts:
+            iperf_client_host = random.choice(available_hosts)
+            stream_server_host.cmd('iperf3 -s &')
+            time.sleep(1)
+            iperf_client_host.cmd(f'iperf3 -c {stream_server_ip} -b 50M -t 360 &')
+            print(f"iperf3 client running on {iperf_client_host.name} ({iperf_client_host.IP()})")
+        else:
+            print("WARNING: No available host for iperf3 client in slice 1")
+
+    else:
+        print("\n%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%")
+        print(f"\n*** WARNING: Scenario '{scenario}' doesn't exist ***\n")
+        print("Please choose one of the following valid scenarios:\n")
+        print("  - 'iperf_web'      : generate iperf3 traffic for web slice")
+        print("  - 'iperf_stream'   : generate iperf3 traffic for stream slice")
+        print("  - 'env_events'     : simulate environmental events on links\n")
+        print("%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%\n")
+        
     print("\n*** Services started ***\n")
 
     # ----- SERVICE MIGRATION LOOP -----
@@ -525,25 +603,6 @@ def scalable_topology(K=2, T=20, auto_recover=True, num_slices=2):
     migration_thread.start()
     print("Migration monitoring started (checking every 5 seconds)\n")
 
-    # ----- ENVIRONMENTAL EVENTS -----
-    def environmental_events():
-        while True:
-            time.sleep(T)
-            leaf = random.choice(leaf_switches)
-            spine = random.choice(spine_switches)
-
-            print(f"\n*** EVENT: disabling link {spine.name} <-> {leaf.name}\n")
-            net.configLinkStatus(spine.name, leaf.name, "down")
-
-            link = net.linksBetween(spine, leaf)[0]
-            print(f"Link state after down: {link.intf1.status()} - {link.intf2.status()}")
-
-            if auto_recover:
-                time.sleep(T)
-                print(f"\n*** RECOVERY: enabling link {spine.name} <-> {leaf.name}\n")
-                net.configLinkStatus(spine.name, leaf.name, "up")
-                print(f"Link state after up: {link.intf1.status()} - {link.intf2.status()}")
-
     #event_thread = threading.Thread(target=environmental_events, daemon=True)
     #event_thread.start()
 
@@ -582,5 +641,7 @@ def scalable_topology(K=2, T=20, auto_recover=True, num_slices=2):
 
 
 if __name__ == "__main__":
+    import sys
+    passed_scenario = sys.argv[1] if len(sys.argv) > 1 else "default"
     setLogLevel("info")
-    scalable_topology(K=2, T=15, auto_recover=False, num_slices=2)
+    scalable_topology(K=2, T=15, auto_recover=False, num_slices=2, scenario=passed_scenario)
