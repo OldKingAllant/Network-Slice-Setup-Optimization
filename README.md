@@ -3,9 +3,9 @@
 SDN-based network slicing with QoS management, service migration, and dynamic DNS resolution.
 
 This is a project developed for the Networking Mod. 2 course (University of Trento), by the students
-- [Nome Cognome] - Badge number: [MATRICOLA]
-- [Nome Cognome] - Badge number: [MATRICOLA]
-- [Nome Cognome] - Badge number: [MATRICOLA]
+- Casagrande Alessandro
+- Lechthaler Niccolò 
+- Vozza	Claudio
 
 ## Architecture
 - **Topology**: Spine-leaf with redundancy
